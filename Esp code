@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 #include <HardwareSerial.h>
 
 HardwareSerial mod(2);
@@ -7,19 +8,42 @@ WebServer server(80);
 
 #define RE_DE 4
 
-// 🔹 WiFi credentials
+// ============================================================
+// WIFI
+// ============================================================
+
 const char* ssid = "realme";
 const char* password = "01234567";
 
-// 🔹 Modbus request
+// ============================================================
+// LAPTOP SERVER
+// ============================================================
+
+const char* serverURL = "http://10.171.67.190:8000/update";
+
+// ============================================================
+// MODBUS REQUEST
+// ============================================================
+
 byte request[] = {
   0x01, 0x03, 0x00, 0x00,
   0x00, 0x07, 0x04, 0x08
 };
 
+// Expected Modbus response:
+// Slave ID      = 1 byte
+// Function      = 1 byte
+// Byte count    = 1 byte
+// 7 registers   = 14 bytes
+// CRC           = 2 bytes
+// TOTAL         = 19 bytes
+
 byte response[19];
 
-// 🔹 Sensor variables (global for web use)
+// ============================================================
+// SENSOR VARIABLES
+// ============================================================
+
 float moisture = 0;
 float temperature = 0;
 int ec = 0;
@@ -28,9 +52,48 @@ int nitrogen = 0;
 int phosphorus = 0;
 int potassium = 0;
 
-// 🌐 Web page
+
+// ============================================================
+// MODBUS CRC16
+// ============================================================
+
+uint16_t modbusCRC(byte *data, int length) {
+
+  uint16_t crc = 0xFFFF;
+
+  for (int pos = 0; pos < length; pos++) {
+
+    crc ^= data[pos];
+
+    for (int i = 0; i < 8; i++) {
+
+      if (crc & 0x0001) {
+        crc >>= 1;
+        crc ^= 0xA001;
+      }
+      else {
+        crc >>= 1;
+      }
+    }
+  }
+
+  return crc;
+}
+
+
+// ============================================================
+// ESP32 WEB PAGE
+// ============================================================
+
 void handleRoot() {
-  String html = "<html><head><title>Soil Monitor</title></head><body>";
+
+  String html =
+    "<html>"
+    "<head>"
+    "<title>Soil Monitor</title>"
+    "</head>"
+    "<body>";
+
   html += "<h1>7-in-1 Soil Sensor</h1>";
 
   html += "<p>Moisture: " + String(moisture) + " %</p>";
@@ -43,72 +106,552 @@ void handleRoot() {
 
   html += "</body></html>";
 
-  server.send(200, "text/html", html);
+  server.send(
+    200,
+    "text/html",
+    html
+  );
 }
 
+
+// ============================================================
+// SEND SENSOR DATA TO SERVER.PY
+// ============================================================
+
+void sendSensorData() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println("WiFi disconnected.");
+    return;
+  }
+
+  HTTPClient http;
+
+  Serial.println();
+  Serial.println("Sending sensor data to server...");
+
+  if (!http.begin(serverURL)) {
+
+    Serial.println("HTTP begin failed.");
+    return;
+  }
+
+  http.addHeader(
+    "Content-Type",
+    "application/json"
+  );
+
+  String jsonData = "{";
+
+  jsonData += "\"moisture\":" + String(moisture, 2) + ",";
+  jsonData += "\"temperature\":" + String(temperature, 2) + ",";
+  jsonData += "\"ph\":" + String(ph, 2) + ",";
+  jsonData += "\"n\":" + String(nitrogen) + ",";
+  jsonData += "\"p\":" + String(phosphorus) + ",";
+  jsonData += "\"k\":" + String(potassium);
+
+  jsonData += "}";
+
+  Serial.println("JSON:");
+  Serial.println(jsonData);
+
+  int httpResponseCode = http.POST(jsonData);
+
+  Serial.print("Server response code: ");
+  Serial.println(httpResponseCode);
+
+  if (httpResponseCode > 0) {
+
+    String responseText = http.getString();
+
+    Serial.println("Server response:");
+    Serial.println(responseText);
+  }
+  else {
+
+    Serial.print("POST failed: ");
+    Serial.println(
+      http.errorToString(httpResponseCode)
+    );
+  }
+
+  http.end();
+}
+
+
+// ============================================================
+// READ SENSOR
+// ============================================================
+
+bool readSensor() {
+
+  // ----------------------------------------------------------
+  // TRY UP TO 3 TIMES
+  // ----------------------------------------------------------
+
+  for (int attempt = 1; attempt <= 3; attempt++) {
+
+    Serial.println();
+    Serial.print("Sensor read attempt: ");
+    Serial.println(attempt);
+
+    // --------------------------------------------------------
+    // CLEAR ANY OLD BYTES
+    // --------------------------------------------------------
+
+    while (mod.available()) {
+      mod.read();
+    }
+
+    // --------------------------------------------------------
+    // TRANSMIT MODE
+    // --------------------------------------------------------
+
+    digitalWrite(
+      RE_DE,
+      HIGH
+    );
+
+    delay(10);
+
+    Serial.println("Sending Modbus request...");
+
+    mod.write(
+      request,
+      sizeof(request)
+    );
+
+    mod.flush();
+
+    // --------------------------------------------------------
+    // SWITCH TO RECEIVE MODE
+    // --------------------------------------------------------
+
+    delay(5);
+
+    digitalWrite(
+      RE_DE,
+      LOW
+    );
+
+    // Give sensor time to start its reply
+    delay(50);
+
+    // --------------------------------------------------------
+    // RECEIVE FULL RESPONSE
+    // --------------------------------------------------------
+
+    int received = 0;
+
+    unsigned long startTime = millis();
+
+    while (
+      received < 19 &&
+      millis() - startTime < 1000
+    ) {
+
+      if (mod.available()) {
+
+        response[received] = mod.read();
+
+        received++;
+      }
+    }
+
+    // --------------------------------------------------------
+    // SHOW NUMBER OF BYTES
+    // --------------------------------------------------------
+
+    Serial.print(
+      "RS485 bytes received: "
+    );
+
+    Serial.println(received);
+
+    // --------------------------------------------------------
+    // PRINT RAW RESPONSE
+    // --------------------------------------------------------
+
+    if (received > 0) {
+
+      Serial.print(
+        "RAW RESPONSE: "
+      );
+
+      for (int i = 0; i < received; i++) {
+
+        if (response[i] < 16) {
+          Serial.print("0");
+        }
+
+        Serial.print(
+          response[i],
+          HEX
+        );
+
+        Serial.print(" ");
+      }
+
+      Serial.println();
+    }
+
+    // --------------------------------------------------------
+    // CHECK RESPONSE LENGTH
+    // --------------------------------------------------------
+
+    if (received != 19) {
+
+      Serial.println(
+        "Incomplete Modbus response."
+      );
+
+      delay(100);
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // CHECK SLAVE ID
+    // --------------------------------------------------------
+
+    if (response[0] != 0x01) {
+
+      Serial.print(
+        "Wrong slave ID: 0x"
+      );
+
+      Serial.println(
+        response[0],
+        HEX
+      );
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // CHECK FUNCTION CODE
+    // --------------------------------------------------------
+
+    if (response[1] != 0x03) {
+
+      Serial.print(
+        "Unexpected function code: 0x"
+      );
+
+      Serial.println(
+        response[1],
+        HEX
+      );
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // CHECK BYTE COUNT
+    // --------------------------------------------------------
+
+    if (response[2] != 14) {
+
+      Serial.print(
+        "Unexpected byte count: "
+      );
+
+      Serial.println(
+        response[2]
+      );
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // CHECK CRC
+    // --------------------------------------------------------
+
+    uint16_t calculatedCRC =
+      modbusCRC(
+        response,
+        17
+      );
+
+    uint16_t receivedCRC =
+      response[17] |
+      (response[18] << 8);
+
+    Serial.print(
+      "Calculated CRC: 0x"
+    );
+
+    Serial.println(
+      calculatedCRC,
+      HEX
+    );
+
+    Serial.print(
+      "Received CRC:   0x"
+    );
+
+    Serial.println(
+      receivedCRC,
+      HEX
+    );
+
+    if (calculatedCRC != receivedCRC) {
+
+      Serial.println(
+        "CRC ERROR"
+      );
+
+      delay(100);
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // DECODE SENSOR DATA
+    // --------------------------------------------------------
+
+    moisture =
+      ((response[3] << 8) | response[4])
+      / 10.0;
+
+    temperature =
+      ((response[5] << 8) | response[6])
+      / 10.0;
+
+    ec =
+      (response[7] << 8) |
+      response[8];
+
+    ph =
+      ((response[9] << 8) | response[10])
+      / 10.0;
+
+    nitrogen =
+      (response[11] << 8) |
+      response[12];
+
+    phosphorus =
+      (response[13] << 8) |
+      response[14];
+
+    potassium =
+      (response[15] << 8) |
+      response[16];
+
+    // --------------------------------------------------------
+    // DISPLAY SENSOR DATA
+    // --------------------------------------------------------
+
+    Serial.println();
+    Serial.println(
+      "=============================="
+    );
+
+    Serial.print(
+      "Moisture    : "
+    );
+    Serial.println(
+      moisture
+    );
+
+    Serial.print(
+      "Temperature : "
+    );
+    Serial.println(
+      temperature
+    );
+
+    Serial.print(
+      "EC          : "
+    );
+    Serial.println(
+      ec
+    );
+
+    Serial.print(
+      "pH          : "
+    );
+    Serial.println(
+      ph
+    );
+
+    Serial.print(
+      "Nitrogen    : "
+    );
+    Serial.println(
+      nitrogen
+    );
+
+    Serial.print(
+      "Phosphorus  : "
+    );
+    Serial.println(
+      phosphorus
+    );
+
+    Serial.print(
+      "Potassium   : "
+    );
+    Serial.println(
+      potassium
+    );
+
+    Serial.println(
+      "=============================="
+    );
+
+    return true;
+  }
+
+  Serial.println();
+  Serial.println(
+    "Sensor read failed after 3 attempts."
+  );
+
+  return false;
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
 void setup() {
+
   Serial.begin(115200);
 
-  pinMode(RE_DE, OUTPUT);
-  digitalWrite(RE_DE, LOW);
+  // ----------------------------------------------------------
+  // RS485 DIRECTION CONTROL
+  // ----------------------------------------------------------
 
-  mod.begin(4800, SERIAL_8N1, 16, 17);
+  pinMode(
+    RE_DE,
+    OUTPUT
+  );
 
-  // 🌐 Connect WiFi
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting");
+  // Start in receive mode
+  digitalWrite(
+    RE_DE,
+    LOW
+  );
 
-  while (WiFi.status() != WL_CONNECTED) {
+  // ----------------------------------------------------------
+  // RS485
+  // RX = GPIO16
+  // TX = GPIO17
+  // ----------------------------------------------------------
+
+  mod.begin(
+    4800,
+    SERIAL_8N1,
+    16,
+    17
+  );
+
+  // ----------------------------------------------------------
+  // SENSOR STARTUP DELAY
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "Waiting for sensor to initialize..."
+  );
+
+  delay(3000);
+
+  // ----------------------------------------------------------
+  // WIFI
+  // ----------------------------------------------------------
+
+  WiFi.begin(
+    ssid,
+    password
+  );
+
+  Serial.print(
+    "Connecting to WiFi"
+  );
+
+  while (
+    WiFi.status() != WL_CONNECTED
+  ) {
+
     delay(500);
+
     Serial.print(".");
   }
 
-  Serial.println("\nConnected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+  Serial.println();
 
-  // 🌐 Start server
-  server.on("/", handleRoot);
+  Serial.println(
+    "WiFi connected!"
+  );
+
+  Serial.print(
+    "ESP32 IP Address: "
+  );
+
+  Serial.println(
+    WiFi.localIP()
+  );
+
+  Serial.print(
+    "Sending data to: "
+  );
+
+  Serial.println(
+    serverURL
+  );
+
+  // ----------------------------------------------------------
+  // ESP32 LOCAL WEB SERVER
+  // ----------------------------------------------------------
+
+  server.on(
+    "/",
+    handleRoot
+  );
+
   server.begin();
+
+  Serial.println(
+    "ESP32 WebServer started."
+  );
 }
+
+
+// ============================================================
+// LOOP
+// ============================================================
 
 void loop() {
 
-  // 🔹 Read sensor (same as your code)
-  digitalWrite(RE_DE, HIGH);
-  delay(10);
+  // ----------------------------------------------------------
+  // READ SENSOR
+  // ----------------------------------------------------------
 
-  mod.write(request, sizeof(request));
-  mod.flush();
+  bool sensorOK = readSensor();
 
-  digitalWrite(RE_DE, LOW);
+  // ----------------------------------------------------------
+  // SEND TO SERVER ONLY IF SENSOR RESPONSE IS VALID
+  // ----------------------------------------------------------
 
-  delay(1000);
+  if (sensorOK) {
 
-  if (mod.available()) {
+    sendSensorData();
+  }
+  else {
 
-    int i = 0;
-
-    while (mod.available() && i < 19) {
-      response[i] = mod.read();
-      i++;
-    }
-
-    if (i == 19) {
-
-      moisture = ((response[3] << 8) | response[4]) / 10.0;
-      temperature = ((response[5] << 8) | response[6]) / 10.0;
-      ec = (response[7] << 8) | response[8];
-      ph = ((response[9] << 8) | response[10]) / 10.0;
-      nitrogen = (response[11] << 8) | response[12];
-      phosphorus = (response[13] << 8) | response[14];
-      potassium = (response[15] << 8) | response[16];
-
-      Serial.println("Updated values");
-    }
+    Serial.println(
+      "No valid sensor data to send."
+    );
   }
 
-  // 🌐 Handle web requests
+  // ----------------------------------------------------------
+  // HANDLE ESP32 WEB REQUESTS
+  // ----------------------------------------------------------
+
   server.handleClient();
 
   delay(2000);
